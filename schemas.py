@@ -15,3 +15,4 @@ ModelEnum = Enum("ModelEnum", language_models, type=str)
 
 class ChatMessage(BaseModel):
     message: str
+    system: str | None = None
