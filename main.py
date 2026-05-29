@@ -3,17 +3,31 @@ from fastapi.responses import StreamingResponse
 import httpx
 import json
 import time
-from schemas import ChatMessage, ModelEnum
+from schemas import ChatRequest, ModelEnum
 
 
 app = FastAPI()
 
 OLLAMA = "http://localhost:11434"
 
+LEVELS = [
+    {"n": 1, "name": "Plain LLM", "available": True,
+     "description": "Single turn, no memory."},
+    {"n": 2, "name": "Memory", "available": True,
+     "description": "Sends the full conversation."},
+]
+
+LEVEL_NAMES = {lv["n"]: lv["name"] for lv in LEVELS}
+
 
 @app.get("/")
 def greet():
     return {"message": "Arise"}
+
+
+@app.get("/levels")
+def list_levels():
+    return LEVELS
 
 
 @app.get("/models")
@@ -40,11 +54,23 @@ def model_template(model: ModelEnum):
     return {"template": get_template(model.value)}
 
 
-def build_payload(model, chat_message, temperature, max_tokens, stream):
+def build_messages(level, request):
     messages = []
-    if chat_message.system:
-        messages.append({"role": "system", "content": chat_message.system})
-    messages.append({"role": "user", "content": chat_message.message})
+    if request.system:
+        messages.append({"role": "system", "content": request.system})
+
+    history = [{"role": m.role, "content": m.content} for m in request.messages]
+    if level == 1:
+        # Plain LLM: only the latest user message, prior turns discarded.
+        last_user = next((m for m in reversed(history) if m["role"] == "user"), None)
+        if last_user:
+            messages.append(last_user)
+    else:
+        messages.extend(history)
+    return messages
+
+
+def build_payload(model, messages, temperature, max_tokens, stream):
     return {
         "model": model.value,
         "messages": messages,
@@ -74,12 +100,14 @@ def compute_stats(data, ttft_s):
 
 @app.post("/chat")
 def chat_with_language_model(
-    chat_message: ChatMessage,
+    request: ChatRequest,
     model: ModelEnum,
+    level: int = 1,
     temperature: float = 0.8,
     max_tokens: int = 512,
 ):
-    payload = build_payload(model, chat_message, temperature, max_tokens, stream=False)
+    messages = build_messages(level, request)
+    payload = build_payload(model, messages, temperature, max_tokens, stream=False)
 
     resp = httpx.post(f"{OLLAMA}/api/chat", json=payload, timeout=None)
     data = resp.json()
@@ -89,6 +117,7 @@ def chat_with_language_model(
     return {
         "message": data["message"]["content"],
         "prompt": payload["messages"],
+        "level": {"n": level, "name": LEVEL_NAMES.get(level, "")},
         "params": {"model": model.value, "temperature": temperature, "max_tokens": max_tokens},
         "stats": compute_stats(data, ttft),
     }
@@ -96,12 +125,14 @@ def chat_with_language_model(
 
 @app.post("/chat/stream")
 def stream_chat_with_language_model(
-    chat_message: ChatMessage,
+    request: ChatRequest,
     model: ModelEnum,
+    level: int = 1,
     temperature: float = 0.8,
     max_tokens: int = 512,
 ):
-    payload = build_payload(model, chat_message, temperature, max_tokens, stream=True)
+    messages = build_messages(level, request)
+    payload = build_payload(model, messages, temperature, max_tokens, stream=True)
 
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -111,6 +142,7 @@ def stream_chat_with_language_model(
             "meta",
             {
                 "prompt": payload["messages"],
+                "level": {"n": level, "name": LEVEL_NAMES.get(level, "")},
                 "params": {"model": model.value, "temperature": temperature, "max_tokens": max_tokens},
             },
         )

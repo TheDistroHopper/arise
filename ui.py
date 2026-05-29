@@ -16,6 +16,10 @@ TOKEN_EXPLAINER = (
 
 @st.dialog("Trace & Metrics", width="large")
 def show_trace(trace):
+    lvl = trace.get("level")
+    if lvl:
+        st.badge(f"Level {lvl['n']} · {lvl['name']}", icon=":material/stairs:", color="primary")
+
     p = trace["params"]
     st.caption(
         f"Model: {p['model']}  ·  temperature: {p['temperature']}  ·  max_tokens: {p['max_tokens']}"
@@ -23,6 +27,8 @@ def show_trace(trace):
 
     st.caption("Messages array sent to the API")
     st.code(json.dumps(trace["prompt"], indent=2), language="json")
+    if lvl and lvl["n"] == 1:
+        st.caption("Level 1 sends only the latest message; prior turns are discarded.")
 
     s = trace["stats"]
     c1, c2, c3 = st.columns(3)
@@ -39,9 +45,25 @@ def show_trace(trace):
     st.markdown(TOKEN_EXPLAINER)
 
 
-def trace_button(trace, key):
-    if trace and st.button("", key=key, icon=":material/analytics:", help="Trace & metrics"):
+def assistant_footer(trace, key):
+    if not trace:
+        return
+    badge, btn = st.columns([0.8, 0.2], vertical_alignment="center")
+    lvl = trace.get("level")
+    if lvl:
+        badge.caption(f":material/stairs: Level {lvl['n']} · {lvl['name']}")
+    if btn.button("", key=key, icon=":material/analytics:", help="Trace & metrics"):
         show_trace(trace)
+
+
+def get_levels():
+    try:
+        resp = httpx.get("http://localhost:8000/levels")
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"ERROR: {e}")
+    return [{"n": 1, "name": "Plain LLM", "available": True, "description": ""}]
 
 
 def get_template(model):
@@ -64,9 +86,9 @@ def get_models():
     return []
 
 
-def get_model_response(prompt, model, system, temperature, max_tokens):
-    params = {"model": model, "temperature": temperature, "max_tokens": max_tokens}
-    payload = {"message": prompt, "system": system or None}
+def get_model_response(messages, model, system, level, temperature, max_tokens):
+    params = {"model": model, "level": level, "temperature": temperature, "max_tokens": max_tokens}
+    payload = {"messages": messages, "system": system or None}
     try:
         resp = httpx.post(
             "http://localhost:8000/chat", params=params, json=payload, timeout=None
@@ -79,9 +101,9 @@ def get_model_response(prompt, model, system, temperature, max_tokens):
     return None
 
 
-def stream_model_response(prompt, model, system, temperature, max_tokens, holder):
-    params = {"model": model, "temperature": temperature, "max_tokens": max_tokens}
-    payload = {"message": prompt, "system": system or None}
+def stream_model_response(messages, model, system, level, temperature, max_tokens, holder):
+    params = {"model": model, "level": level, "temperature": temperature, "max_tokens": max_tokens}
+    payload = {"messages": messages, "system": system or None}
 
     with httpx.stream(
         "POST", "http://localhost:8000/chat/stream", params=params, json=payload, timeout=None
@@ -95,6 +117,7 @@ def stream_model_response(prompt, model, system, temperature, max_tokens, holder
                 if event == "meta":
                     holder["prompt"] = data["prompt"]
                     holder["params"] = data["params"]
+                    holder["level"] = data.get("level")
                 elif event == "token":
                     yield data["content"]
                 elif event == "stats":
@@ -105,6 +128,18 @@ def stream_model_response(prompt, model, system, temperature, max_tokens, holder
 
 with st.sidebar:
     st.title(":material/robot: Arise")
+
+    levels = get_levels()
+    available = [lv for lv in levels if lv["available"]]
+    labels = {lv["n"]: f"Level {lv['n']}: {lv['name']}" for lv in levels}
+    selected_level = st.selectbox(
+        "Level", [lv["n"] for lv in available], format_func=lambda n: labels[n]
+    )
+    active = next(lv for lv in levels if lv["n"] == selected_level)
+    st.caption(active["description"])
+
+    st.divider()
+
     models = get_models()
     selected_model = st.selectbox("Select Model", models, label_visibility="collapsed")
     use_stream = st.toggle("Stream", value=True)
@@ -125,13 +160,16 @@ for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("trace"):
-            trace_button(message["trace"], key=f"trace_{i}")
+            assistant_footer(message["trace"], key=f"trace_{i}")
 
 # React to user input
 prompt = st.chat_input("What is up?")
 if prompt:
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # The whole conversation is always sent; the level decides how much is used.
+    history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
 
     with st.chat_message("assistant"):
         trace = None
@@ -140,21 +178,25 @@ if prompt:
             holder = {}
             response = st.write_stream(
                 stream_model_response(
-                    prompt, selected_model, system_prompt, temperature, max_tokens, holder
+                    history, selected_model, system_prompt, selected_level, temperature, max_tokens, holder
                 )
             )
             if "stats" in holder:
                 trace = {
                     "prompt": holder["prompt"],
+                    "level": holder.get("level"),
                     "params": holder["params"],
                     "stats": holder["stats"],
                 }
         else:
-            result = get_model_response(prompt, selected_model, system_prompt, temperature, max_tokens)
+            result = get_model_response(
+                history, selected_model, system_prompt, selected_level, temperature, max_tokens
+            )
             if result:
                 response = result["message"]
                 trace = {
                     "prompt": result["prompt"],
+                    "level": result.get("level"),
                     "params": result["params"],
                     "stats": result["stats"],
                 }
@@ -163,6 +205,6 @@ if prompt:
             st.markdown(response)
 
         if trace:
-            trace_button(trace, key=f"trace_{len(st.session_state.messages)}")
+            assistant_footer(trace, key=f"trace_{len(st.session_state.messages)}")
 
     st.session_state.messages.append({"role": "assistant", "content": response, "trace": trace})

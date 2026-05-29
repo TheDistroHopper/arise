@@ -13,6 +13,11 @@ language_models = {
 ModelEnum = Enum("ModelEnum", language_models, type=str)
 
 
-class ChatMessage(BaseModel):
-    message: str
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
     system: str | None = None
